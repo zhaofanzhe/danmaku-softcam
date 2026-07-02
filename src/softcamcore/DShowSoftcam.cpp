@@ -93,6 +93,15 @@ std::string IID_TO_STR(REFIID riid)
 //
 // YUV family follows in 4:2:2 then 4:2:0 order, then monochrome, then MJPG.
 
+// MEDIASUBTYPE_Y800 is not declared by the standard DirectShow headers.
+// Build it via the canonical FOURCC->GUID formula that DirectShow uses
+// internally for unregistered FOURCCs: Data1 = mmioFOURCC('Y','8','0','0')
+// in little-endian, Data2/Data3 fixed at 0x0000/0x0010, Data4 = the
+// standard DirectShow suffix. This GUID matches the one 咩播,
+// ManyCam, Logitech Capture and other virtual cameras advertise.
+static const GUID MEDIASUBTYPE_Y800_STD =
+    { 0x30303859, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+
 static const SubtypeInfo kSubtypes[] = {
     // 32-bit RGB family. ARGB32 carries alpha; RGB32 is byte-identical in
     // memory but advertises as MEDIASUBTYPE_RGB32 so older capture graphs
@@ -109,6 +118,10 @@ static const SubtypeInfo kSubtypes[] = {
     { &MEDIASUBTYPE_IYUV,   12, MAKEFOURCC('I','Y','U','V'), mmioFOURCC('I','Y','U','V'), 0, L"IYUV (I420)" },
     { &MEDIASUBTYPE_YV12,   12, MAKEFOURCC('Y','V','1','2'), mmioFOURCC('Y','V','1','2'), 0, L"YV12"        },
     { &MEDIASUBTYPE_NV12,   12, MAKEFOURCC('N','V','1','2'), mmioFOURCC('N','V','1','2'), 0, L"NV12"        },
+
+    // Monochrome (luma only, no chroma). Useful for machine vision,
+    // infrared and document scanner pipelines. 1 byte per pixel.
+    { &MEDIASUBTYPE_Y800_STD, 8, MAKEFOURCC('Y','8','0','0'), mmioFOURCC('Y','8','0','0'), 0, L"Y800" },
 
     // JPEG (variable length, image size left to encoder)
     { &MEDIASUBTYPE_MJPG,    0, MAKEFOURCC('M','J','P','G'), mmioFOURCC('M','J','P','G'), 0, L"MJPG" },
@@ -612,6 +625,11 @@ void fill_yuv_subtype(uint8_t* pData, int w, int h,
                                       uv_plane, uv_stride,
                                       static_cast<std::uint32_t>(w),
                                       static_cast<std::uint32_t>(h));
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_Y800_STD)
+    {
+        softcam::convert_bgra_to_y800(bgra_topdown, pData,
+                                      static_cast<std::size_t>(w) * h);
     }
     else if (sub.subtype == &MEDIASUBTYPE_MJPG)
     {
