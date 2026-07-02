@@ -396,40 +396,13 @@ TEST(SenderIsConnected, InvalidArgs)
     EXPECT_EQ( ret, false );
 }
 
-TEST(SenderCreateCamera, RGBA32Format)
-{
-    auto handle = sender::CreateCamera(64, 48, 30.0f, sender::FORMAT_RGBA32);
-    EXPECT_TRUE( handle );
-
-    auto fb = sc::FrameBuffer::open();
-    ASSERT_TRUE( fb );
-    EXPECT_EQ( fb.width(), 64 );
-    EXPECT_EQ( fb.height(), 48 );
-    EXPECT_EQ( fb.framerate(), 30 );
-    EXPECT_EQ( fb.imageFormat(), sc::ImageFormat::RGBA32 );
-
-    sender::DeleteCamera(handle);
-}
-
-TEST(SenderCreateCamera, RGB24FormatDefault)
-{
-    auto handle = sender::CreateCamera(64, 48, 30.0f);
-    EXPECT_TRUE( handle );
-
-    auto fb = sc::FrameBuffer::open();
-    ASSERT_TRUE( fb );
-    EXPECT_EQ( fb.imageFormat(), sc::ImageFormat::RGB24 );
-
-    sender::DeleteCamera(handle);
-}
-
 TEST(SenderSendFrameRGBA, BasicRoundTrip)
 {
     const int W = 64;
     const int H = 48;
     const float TIMEOUT = 1.0f;
 
-    auto handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGBA32);
+    auto handle = sender::CreateCamera(W, H, 60.0f);
     ASSERT_TRUE( handle );
 
     std::atomic<int> flag = 0;
@@ -438,7 +411,6 @@ TEST(SenderSendFrameRGBA, BasicRoundTrip)
     {
         auto fb = sc::FrameBuffer::open();
         ASSERT_TRUE( fb );
-        ASSERT_EQ( fb.imageFormat(), sc::ImageFormat::RGBA32 );
 
         EXPECT_EQ( fb.frameCounter(), 0 );
         flag = 1;
@@ -492,30 +464,9 @@ TEST(SenderSendFrameRGBA, BasicRoundTrip)
     sender::DeleteCamera(handle);
 }
 
-TEST(SenderSendFrameRGBA, RejectedIfCameraWasRGB24)
-{
-    auto handle = sender::CreateCamera(64, 48, 60.0f, sender::FORMAT_RGB24);
-    ASSERT_TRUE( handle );
-
-    auto fb = sc::FrameBuffer::open();
-    ASSERT_TRUE( fb );
-    ASSERT_EQ( fb.imageFormat(), sc::ImageFormat::RGB24 );
-    EXPECT_EQ( fb.frameCounter(), 0 );
-
-    // Should be a no-op: the camera's shared buffer is sized for 3 bytes/pixel,
-    // writing 4 bytes/pixel would overflow.
-    unsigned char rgba[64 * 48 * 4] = {};
-    std::memset(rgba, 0xAA, sizeof(rgba));
-    sender::SendFrameRGBA(handle, rgba);
-
-    EXPECT_EQ( fb.frameCounter(), 0 );
-
-    sender::DeleteCamera(handle);
-}
-
 TEST(SenderSendFrameRGBA, InvalidArgs)
 {
-    auto handle = sender::CreateCamera(64, 48, 60.0f, sender::FORMAT_RGBA32);
+    auto handle = sender::CreateCamera(64, 48, 60.0f);
     unsigned char rgba[64 * 48 * 4] = {};
 
     EXPECT_NO_THROW({ sender::SendFrameRGBA(nullptr, nullptr); });
@@ -523,31 +474,6 @@ TEST(SenderSendFrameRGBA, InvalidArgs)
     EXPECT_NO_THROW({ sender::SendFrameRGBA(handle, nullptr); });
 
     sender::DeleteCamera(handle);
-}
-
-TEST(SenderCreateCamera, RGBA32RequiresLargerSharedMemory)
-{
-    const int W = 64;
-    const int H = 48;
-
-    auto rgb_handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGB24);
-    auto rgb_fb = sc::FrameBuffer::open();
-    ASSERT_TRUE( rgb_fb );
-    auto rgb_size = rgb_fb.handle() ? 1 : 0; // touch handle to ensure open worked
-
-    sender::DeleteCamera(rgb_handle);
-
-    auto rgba_handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGBA32);
-    ASSERT_TRUE( rgba_handle );
-
-    // After deleting RGB camera and creating RGBA, the new buffer must be
-    // sized for 4 bytes/pixel. Verify by reading imageFormat().
-    auto rgba_fb = sc::FrameBuffer::open();
-    ASSERT_TRUE( rgba_fb );
-    EXPECT_EQ( rgba_fb.imageFormat(), sc::ImageFormat::RGBA32 );
-
-    sender::DeleteCamera(rgba_handle);
-    (void)rgb_size;
 }
 
 } //namespace SenderAPITest

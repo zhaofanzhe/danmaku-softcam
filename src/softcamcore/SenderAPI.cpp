@@ -1,9 +1,12 @@
 #include "SenderAPI.h"
 
 #include <atomic>
+#include <cstring>
+#include <vector>
 
 #include "FrameBuffer.h"
 #include "Misc.h"
+#include "SimdConvert.h"
 
 
 namespace {
@@ -22,12 +25,9 @@ std::atomic<Camera*>    s_camera;
 namespace softcam {
 namespace sender {
 
-CameraHandle    CreateCamera(int width, int height, float framerate, int format)
+CameraHandle    CreateCamera(int width, int height, float framerate)
 {
-    auto fmt = (format == FORMAT_RGBA32)
-                   ? softcam::ImageFormat::RGBA32
-                   : softcam::ImageFormat::RGB24;
-    if (auto fb = FrameBuffer::create(width, height, framerate, fmt))
+    if (auto fb = FrameBuffer::create(width, height, framerate))
     {
         Camera* camera = new Camera{ fb, Timer() };
         Camera* expected = nullptr;
@@ -103,21 +103,32 @@ void            SendFrameRGBA(CameraHandle camera, const void* rgba_bits)
     Camera* target = static_cast<Camera*>(camera);
     if (target && s_camera.load() == target && rgba_bits)
     {
-        // Reject if the camera was created with the RGB24 format; the
-        // FrameBuffer is sized for 3 bytes/pixel and a 4-byte/pixel write
-        // would overflow the shared memory.
-        if (target->m_frame_buffer.imageFormat()
-            != softcam::ImageFormat::RGBA32)
-        {
-            return;
-        }
-
         auto framerate = target->m_frame_buffer.framerate();
         auto frame_counter = target->m_frame_buffer.frameCounter();
+        int w = target->m_frame_buffer.width();
+        int h = target->m_frame_buffer.height();
+        std::size_t pixel_count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
 
         throttle(*target, framerate, frame_counter);
 
-        target->m_frame_buffer.write(rgba_bits);
+        // Convert RGBA (top-down, byte order R,G,B,A) to BGR (top-down,
+        // byte order B,G,R) -- the layout transferToDIB expects to find
+        // verbatim in shared memory. SimdConvert picks SSE2/AVX2 when
+        // available, scalar fallback otherwise.
+        //
+        // We allocate a full-frame scratch buffer (w*h*3 bytes) so the
+        // write() lock is acquired exactly once, matching SendFrame
+        // semantics. For 1920x1080 this is ~6 MB per call, which we
+        // re-use across calls via a thread_local to avoid the allocation
+        // churn.
+        static thread_local std::vector<uint8_t> scratch;
+        std::size_t need = pixel_count * 3;
+        if (scratch.size() < need) scratch.resize(need);
+        convert_rgba_to_bgr(
+            static_cast<const uint8_t*>(rgba_bits),
+            scratch.data(),
+            pixel_count);
+        target->m_frame_buffer.write(scratch.data());
     }
 }
 
