@@ -14,6 +14,24 @@ using std::uint32_t;
 using std::uint16_t;
 
 
+/// Pixel format of the image data stored in the shared frame buffer.
+///
+/// The Sender writes pixels in this format; the Receiver reads them in the
+/// same format. DirectShow consumers always receive RGB24 in the DIB
+/// (BI_RGB / MEDIASUBTYPE_RGB24) regardless of the shared buffer format --
+/// `transferToDIB` performs the conversion if the source format is RGBA32.
+enum class ImageFormat : uint8_t
+{
+    RGB24  = 0,
+    RGBA32 = 1,
+};
+
+inline constexpr std::size_t bytesPerPixel(ImageFormat fmt) noexcept
+{
+    return fmt == ImageFormat::RGBA32 ? std::size_t{4} : std::size_t{3};
+}
+
+
 /// Shared frame buffer between processes (sender and receiver)
 class FrameBuffer
 {
@@ -21,7 +39,8 @@ class FrameBuffer
     static FrameBuffer create(
                         int             width,
                         int             height,
-                        float           framerate = 0.0f);
+                        float           framerate = 0.0f,
+                        ImageFormat     format = ImageFormat::RGB24);
     static FrameBuffer open();
 
     FrameBuffer& operator =(const FrameBuffer&);
@@ -32,6 +51,7 @@ class FrameBuffer
     int             height() const;
     float           framerate() const;
     uint64_t        frameCounter() const;
+    ImageFormat     imageFormat() const;
     bool            active() const;
     bool            connected() const;
 
@@ -64,7 +84,8 @@ class FrameBuffer
                         int height);
     static uint32_t calcMemorySize(
                         uint16_t width,
-                        uint16_t height);
+                        uint16_t height,
+                        ImageFormat format);
 };
 
 

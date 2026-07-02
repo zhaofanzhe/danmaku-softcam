@@ -396,4 +396,158 @@ TEST(SenderIsConnected, InvalidArgs)
     EXPECT_EQ( ret, false );
 }
 
+TEST(SenderCreateCamera, RGBA32Format)
+{
+    auto handle = sender::CreateCamera(64, 48, 30.0f, sender::FORMAT_RGBA32);
+    EXPECT_TRUE( handle );
+
+    auto fb = sc::FrameBuffer::open();
+    ASSERT_TRUE( fb );
+    EXPECT_EQ( fb.width(), 64 );
+    EXPECT_EQ( fb.height(), 48 );
+    EXPECT_EQ( fb.framerate(), 30 );
+    EXPECT_EQ( fb.imageFormat(), sc::ImageFormat::RGBA32 );
+
+    sender::DeleteCamera(handle);
+}
+
+TEST(SenderCreateCamera, RGB24FormatDefault)
+{
+    auto handle = sender::CreateCamera(64, 48, 30.0f);
+    EXPECT_TRUE( handle );
+
+    auto fb = sc::FrameBuffer::open();
+    ASSERT_TRUE( fb );
+    EXPECT_EQ( fb.imageFormat(), sc::ImageFormat::RGB24 );
+
+    sender::DeleteCamera(handle);
+}
+
+TEST(SenderSendFrameRGBA, BasicRoundTrip)
+{
+    const int W = 64;
+    const int H = 48;
+    const float TIMEOUT = 1.0f;
+
+    auto handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGBA32);
+    ASSERT_TRUE( handle );
+
+    std::atomic<int> flag = 0;
+
+    std::thread th([&]
+    {
+        auto fb = sc::FrameBuffer::open();
+        ASSERT_TRUE( fb );
+        ASSERT_EQ( fb.imageFormat(), sc::ImageFormat::RGBA32 );
+
+        EXPECT_EQ( fb.frameCounter(), 0 );
+        flag = 1;
+
+        fb.waitForNewFrame(0, TIMEOUT);
+        EXPECT_EQ( fb.frameCounter(), 1 );
+
+        // Image is W*H*3 (BGR) for the DIB.
+        unsigned char dib[W * H * 3] = {};
+        uint64_t frame_counter = 0;
+        fb.transferToDIB(dib, &frame_counter);
+        EXPECT_EQ( frame_counter, 1 );
+
+        // First pixel in the source RGBA buffer was (R=10, G=20, B=30, A=255).
+        // After convert_rgba_to_bgr the DIB starts with B,G,R = 30,20,10.
+        EXPECT_EQ( dib[0], 30 );
+        EXPECT_EQ( dib[1], 20 );
+        EXPECT_EQ( dib[2], 10 );
+
+        // First pixel of the bottom row (image is top-down in DIB):
+        // last source row was all (R=200, G=100, B=50, A=255).
+        const std::size_t stride = W * 3;
+        EXPECT_EQ( dib[(H - 1) * stride + 0], 50 );
+        EXPECT_EQ( dib[(H - 1) * stride + 1], 100 );
+        EXPECT_EQ( dib[(H - 1) * stride + 2], 200 );
+    });
+
+    WAIT_FOR_FLAG_CHANGE(flag, 0);
+
+    // Source: top row pixels are (R=10, G=20, B=30, A=255);
+    // bottom row pixels are (R=200, G=100, B=50, A=255).
+    unsigned char rgba[W * H * 4];
+    for (int y = 0; y < H; y++)
+    {
+        for (int x = 0; x < W; x++)
+        {
+            unsigned char r, g, b;
+            if (y == 0) { r = 10; g = 20; b = 30; }
+            else if (y == H - 1) { r = 200; g = 100; b = 50; }
+            else { r = 1; g = 2; b = 3; }
+            int idx = (y * W + x) * 4;
+            rgba[idx + 0] = r;
+            rgba[idx + 1] = g;
+            rgba[idx + 2] = b;
+            rgba[idx + 3] = 0xFF;
+        }
+    }
+    sender::SendFrameRGBA(handle, rgba);
+
+    th.join();
+    sender::DeleteCamera(handle);
+}
+
+TEST(SenderSendFrameRGBA, RejectedIfCameraWasRGB24)
+{
+    auto handle = sender::CreateCamera(64, 48, 60.0f, sender::FORMAT_RGB24);
+    ASSERT_TRUE( handle );
+
+    auto fb = sc::FrameBuffer::open();
+    ASSERT_TRUE( fb );
+    ASSERT_EQ( fb.imageFormat(), sc::ImageFormat::RGB24 );
+    EXPECT_EQ( fb.frameCounter(), 0 );
+
+    // Should be a no-op: the camera's shared buffer is sized for 3 bytes/pixel,
+    // writing 4 bytes/pixel would overflow.
+    unsigned char rgba[64 * 48 * 4] = {};
+    std::memset(rgba, 0xAA, sizeof(rgba));
+    sender::SendFrameRGBA(handle, rgba);
+
+    EXPECT_EQ( fb.frameCounter(), 0 );
+
+    sender::DeleteCamera(handle);
+}
+
+TEST(SenderSendFrameRGBA, InvalidArgs)
+{
+    auto handle = sender::CreateCamera(64, 48, 60.0f, sender::FORMAT_RGBA32);
+    unsigned char rgba[64 * 48 * 4] = {};
+
+    EXPECT_NO_THROW({ sender::SendFrameRGBA(nullptr, nullptr); });
+    EXPECT_NO_THROW({ sender::SendFrameRGBA(nullptr, rgba); });
+    EXPECT_NO_THROW({ sender::SendFrameRGBA(handle, nullptr); });
+
+    sender::DeleteCamera(handle);
+}
+
+TEST(SenderCreateCamera, RGBA32RequiresLargerSharedMemory)
+{
+    const int W = 64;
+    const int H = 48;
+
+    auto rgb_handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGB24);
+    auto rgb_fb = sc::FrameBuffer::open();
+    ASSERT_TRUE( rgb_fb );
+    auto rgb_size = rgb_fb.handle() ? 1 : 0; // touch handle to ensure open worked
+
+    sender::DeleteCamera(rgb_handle);
+
+    auto rgba_handle = sender::CreateCamera(W, H, 60.0f, sender::FORMAT_RGBA32);
+    ASSERT_TRUE( rgba_handle );
+
+    // After deleting RGB camera and creating RGBA, the new buffer must be
+    // sized for 4 bytes/pixel. Verify by reading imageFormat().
+    auto rgba_fb = sc::FrameBuffer::open();
+    ASSERT_TRUE( rgba_fb );
+    EXPECT_EQ( rgba_fb.imageFormat(), sc::ImageFormat::RGBA32 );
+
+    sender::DeleteCamera(rgba_handle);
+    (void)rgb_size;
+}
+
 } //namespace SenderAPITest

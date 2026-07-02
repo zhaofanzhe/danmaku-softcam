@@ -363,4 +363,107 @@ TEST(FrameBuffer, SenderDetectsReceiversDisconnection) {
     EXPECT_FALSE( sender.connected() );
 }
 
+TEST(FrameBuffer, RGBA32ImageFormat) {
+    auto fb = sc::FrameBuffer::create(64, 48, 60, sc::ImageFormat::RGBA32);
+    EXPECT_TRUE( fb );
+    EXPECT_EQ( fb.imageFormat(), sc::ImageFormat::RGBA32 );
+
+    auto opened = sc::FrameBuffer::open();
+    ASSERT_TRUE( opened );
+    EXPECT_EQ( opened.imageFormat(), sc::ImageFormat::RGBA32 );
+}
+
+TEST(FrameBuffer, RGBA32WriteAndTransferToDIB) {
+    const int W = 64;
+    const int H = 48;
+    auto fb = sc::FrameBuffer::create(W, H, 60, sc::ImageFormat::RGBA32);
+    ASSERT_TRUE( fb );
+
+    // Source RGBA: every pixel is R=10, G=20, B=30, A=255 (top-down).
+    std::vector<uint8_t> src(W * H * 4);
+    for (int i = 0; i < W * H; i++)
+    {
+        src[i * 4 + 0] = 10;
+        src[i * 4 + 1] = 20;
+        src[i * 4 + 2] = 30;
+        src[i * 4 + 3] = 0xFF;
+    }
+    fb.write(src.data());
+    EXPECT_EQ( fb.frameCounter(), 1 );
+
+    // DIB (BGR byte order, bottom-up).
+    std::vector<uint8_t> dest(W * H * 3);
+    uint64_t frame_counter = 0;
+    fb.transferToDIB(dest.data(), &frame_counter);
+    EXPECT_EQ( frame_counter, 1 );
+
+    // Every pixel in the DIB should be (B=30, G=20, R=10), in BGR byte order.
+    int errors = 0;
+    for (int i = 0; i < W * H; i++)
+    {
+        if (dest[i * 3 + 0] != 30 ||
+            dest[i * 3 + 1] != 20 ||
+            dest[i * 3 + 2] != 10)
+        {
+            errors += 1;
+        }
+    }
+    EXPECT_EQ( errors, 0 );
+}
+
+TEST(FrameBuffer, RGBA32TransferWithStridePadding) {
+    // Width not a multiple of 4 -> transferToDIB has to honour the DIB
+    // stride gap. 17 * 3 = 51, pad to 52 bytes.
+    const int W = 17;
+    const int H = 5;
+    auto fb = sc::FrameBuffer::create(W, H, 60, sc::ImageFormat::RGBA32);
+    ASSERT_TRUE( fb );
+
+    // Source RGBA: each row filled with a distinct value so we can detect
+    // cross-row bleed from the SSE2 storeu that writes 16 bytes.
+    std::vector<uint8_t> src(W * H * 4);
+    for (int y = 0; y < H; y++)
+    {
+        for (int x = 0; x < W; x++)
+        {
+            int idx = (y * W + x) * 4;
+            src[idx + 0] = (uint8_t)(10 + y);  // R varies per row
+            src[idx + 1] = 20;
+            src[idx + 2] = 30;
+            src[idx + 3] = 0xFF;
+        }
+    }
+    fb.write(src.data());
+
+    std::vector<uint8_t> dest(W * H * 4, 0xCC); // fill with sentinel
+    uint64_t frame_counter = 0;
+    fb.transferToDIB(dest.data(), &frame_counter);
+
+    // DIB stride = 52 bytes; verify each row is exactly the right BGR values.
+    const int stride = ((W * 3 + 3) & ~3);
+    int errors = 0;
+    for (int y = 0; y < H; y++)
+    {
+        for (int x = 0; x < W; x++)
+        {
+            int idx = y * stride + x * 3;
+            uint8_t expectedB = 30;
+            uint8_t expectedG = 20;
+            uint8_t expectedR = (uint8_t)(10 + y);
+            if (dest[idx + 0] != expectedB ||
+                dest[idx + 1] != expectedG ||
+                dest[idx + 2] != expectedR)
+            {
+                errors += 1;
+            }
+        }
+        // Padding byte just past row end should still be the sentinel.
+        if (W * 3 < stride && dest[y * stride + W * 3] != 0xCC)
+        {
+            errors += 1;
+        }
+    }
+    EXPECT_EQ( errors, 0 );
+}
+
 } //namespace FrameBufferTest

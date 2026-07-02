@@ -2,6 +2,9 @@
 
 #include <windows.h>
 #include <mutex> // lock_guard
+#include <cstring>
+
+#include "SimdConvert.h"
 
 
 namespace softcam {
@@ -9,7 +12,10 @@ namespace softcam {
 
 const char NamedMutexName[] = "DirectShow Softcam/NamedMutex";
 const char SharedMemoryName[] = "DirectShow Softcam/SharedMemory";
-const uint8_t ProtocolVersion = 2;
+// Bumped from 2 to 3 when RGBA32 ImageFormat support was added.
+// Receivers/senders built against ProtocolVersion < 3 cannot safely interoperate
+// when the shared buffer is in RGBA32 format (they assume RGB24 layout).
+const uint8_t ProtocolVersion = 3;
 
 
 struct FrameBuffer::Header
@@ -19,10 +25,11 @@ struct FrameBuffer::Header
     uint16_t    m_height;
     float       m_framerate;
     uint8_t     m_is_active;
-    uint8_t     m_connected_min_version; // 0 or 1 or 2
+    uint8_t     m_connected_min_version; // 0 or 1 or 2 or 3
     uint8_t     m_watchdog_sender_heartbeat;
     uint8_t     m_watchdog_receiver_heartbeat;
     uint64_t    m_frame_counter;
+    uint8_t     m_image_format;   // ImageFormat enum value
 
     uint8_t*    imageData();
 };
@@ -38,7 +45,8 @@ uint8_t* FrameBuffer::Header::imageData()
 FrameBuffer FrameBuffer::create(
                         int             width,
                         int             height,
-                        float           framerate)
+                        float           framerate,
+                        ImageFormat     format)
 {
     FrameBuffer fb(NamedMutexName);
 
@@ -51,7 +59,7 @@ FrameBuffer FrameBuffer::create(
         return fb;
     }
 
-    auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height);
+    auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height, format);
     fb.m_shmem = SharedMemory::create(SharedMemoryName, shmem_size);
     if (fb.m_shmem)
     {
@@ -67,6 +75,7 @@ FrameBuffer FrameBuffer::create(
         frame->m_watchdog_sender_heartbeat = 0;
         frame->m_watchdog_receiver_heartbeat = 0;
         frame->m_frame_counter = 0;
+        frame->m_image_format = static_cast<uint8_t>(format);
 
         auto mutex = fb.m_mutex;
         fb.m_sender_watchdog = Watchdog::createHeartbeat(
@@ -110,7 +119,13 @@ FrameBuffer FrameBuffer::open()
             fb.m_shmem = {};
             return fb;
         }
-        uint32_t image_size = (uint32_t)frame->m_width * (uint32_t)frame->m_height * 3;
+        auto fmt = static_cast<ImageFormat>(frame->m_image_format);
+        // For RGBA32 the sender must be ProtocolVersion 3+; older build artifacts
+        // may not have populated m_image_format at all, in which case it reads as 0
+        // (RGB24) by luck -- explicit validation is unnecessary because the size
+        // check below rejects any format/size mismatch.
+        uint32_t image_size = (uint32_t)frame->m_width * (uint32_t)frame->m_height
+                              * (uint32_t)bytesPerPixel(fmt);
         if (size <= frame->m_image_offset ||
             size - frame->m_image_offset < image_size)
         {
@@ -186,6 +201,16 @@ uint64_t FrameBuffer::frameCounter() const
     return m_shmem ? header()->m_frame_counter : 0;
 }
 
+ImageFormat FrameBuffer::imageFormat() const
+{
+    std::lock_guard<NamedMutex> lock(m_mutex);
+    if (!m_shmem) return ImageFormat::RGB24;
+    auto raw = header()->m_image_format;
+    return raw == static_cast<uint8_t>(ImageFormat::RGBA32)
+               ? ImageFormat::RGBA32
+               : ImageFormat::RGB24;
+}
+
 bool FrameBuffer::active() const
 {
     std::lock_guard<NamedMutex> lock(m_mutex);
@@ -227,10 +252,10 @@ void FrameBuffer::write(const void* image_bits)
     if (!m_shmem) return;
     std::lock_guard<NamedMutex> lock(m_mutex);
     auto frame = header();
-    std::memcpy(
-            frame->imageData(),
-            image_bits,
-            (std::size_t)3 * frame->m_width * frame->m_height);
+    auto fmt = static_cast<ImageFormat>(frame->m_image_format);
+    std::size_t bytes = (std::size_t)frame->m_width * frame->m_height
+                        * bytesPerPixel(fmt);
+    std::memcpy(frame->imageData(), image_bits, bytes);
     frame->m_frame_counter += 1;
 }
 
@@ -250,11 +275,27 @@ void FrameBuffer::transferToDIB(void* image_bits, uint64_t* out_frame_counter)
         int gap = ((w * 3 + 3) & ~3) - w * 3;
         const std::uint8_t* image = frame->imageData();
         std::uint8_t* dest = (std::uint8_t*)image_bits;
-        for (int y = 0; y < h; y++)
+        auto fmt = static_cast<ImageFormat>(frame->m_image_format);
+        if (fmt == ImageFormat::RGBA32)
         {
-            const std::uint8_t* src = image + 3 * w * (h - 1 - y);
-            std::memcpy(dest, src, 3 * (uint32_t)w);
-            dest += 3 * w + gap;
+            // Convert RGBA -> BGR (DIB RGB24) per row, then flip vertically.
+            // convert_rgba_to_bgr is SSE2/AVX2 when available, scalar otherwise.
+            for (int y = 0; y < h; y++)
+            {
+                const std::uint8_t* src_row =
+                    image + 4 * w * (h - 1 - y);
+                convert_rgba_to_bgr(src_row, dest, (std::size_t)w);
+                dest += 3 * w + gap;
+            }
+        }
+        else
+        {
+            for (int y = 0; y < h; y++)
+            {
+                const std::uint8_t* src = image + 3 * w * (h - 1 - y);
+                std::memcpy(dest, src, 3 * (uint32_t)w);
+                dest += 3 * w + gap;
+            }
         }
         *out_frame_counter = frame->m_frame_counter;
     }
@@ -314,10 +355,12 @@ bool FrameBuffer::checkDimensions(
 
 uint32_t FrameBuffer::calcMemorySize(
                         uint16_t width,
-                        uint16_t height)
+                        uint16_t height,
+                        ImageFormat format)
 {
     uint32_t header_size = sizeof(Header);
-    uint32_t image_size = (uint32_t)width * height * 3;
+    uint32_t image_size = (uint32_t)width * height
+                          * (uint32_t)bytesPerPixel(format);
     uint32_t shmem_size = header_size + image_size;
     return shmem_size;
 }
