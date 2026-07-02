@@ -141,10 +141,10 @@ int main()
     // no matter there is a receiver or not.
     scWaitForConnection(cam);
 
-    // Our canvas is a simple array of RGB pixels.
-    // Note that the color component order is BGR, not RGB.
-    // This is due to the convention of DirectShow.
-    std::vector<unsigned char> image(WIDTH * HEIGHT * 3);
+    // Our canvas is a simple array of RGBA pixels.
+    // v3 protocol: byte order is R, G, B, A (4 bytes per pixel) top-down.
+    // softcam.dll converts to BGRA internally for shared memory.
+    std::vector<unsigned char> image(WIDTH * HEIGHT * 4);
 
     // This is an example class for drawing something to the canvas.
     BouncingBalls balls;
@@ -156,7 +156,7 @@ int main()
         balls.draw(image.data());
 
         // Send the image as a newly captured frame of the camera.
-        scSendFrame(cam, image.data());
+        scSendFrameRGBA(cam, image.data());
     }
 
     // Delete the camera instance.

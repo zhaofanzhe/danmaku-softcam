@@ -39,7 +39,8 @@ class Camera
             throw std::runtime_error("the camera instance has been deleted");
         }
         py::buffer_info info = image.request();
-        if (info.ndim != 3 || info.shape[2] != 3)
+        // v3 protocol: 4-channel RGBA (R,G,B,A byte order) per pixel.
+        if (info.ndim != 3 || info.shape[2] != 4)
         {
             std::string actual_shape;
             for (int i = 0; i < info.ndim; i++) {
@@ -49,9 +50,9 @@ class Camera
                 }
             }
             throw std::invalid_argument(
-                "'image' argument must be an BGR image (3-dim array): "
+                "'image' argument must be an RGBA image (3-dim array): "
                 "expected shape=("
-                    + std::to_string(m_height) + "," + std::to_string(m_width) + ",3), "
+                    + std::to_string(m_height) + "," + std::to_string(m_width) + ",4), "
                 "actual shape=(" + actual_shape + ")"
             );
         }
@@ -65,7 +66,7 @@ class Camera
         }
 
         py::gil_scoped_release release;
-        scSendFrame(m_camera, image.data(0, 0));
+        scSendFrameRGBA(m_camera, image.data(0, 0));
     }
 
     bool WaitForConnection(float timeout = 0.0f)

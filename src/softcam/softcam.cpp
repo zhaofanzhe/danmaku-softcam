@@ -167,9 +167,14 @@ extern "C" void     scDeleteCamera(scCamera camera)
     return softcam::sender::DeleteCamera(camera);
 }
 
-extern "C" void     scSendFrame(scCamera camera, const void* image_bits)
+extern "C" void     scSendFrameRGBA(scCamera camera, const void* rgba_bits)
 {
-    return softcam::sender::SendFrame(camera, image_bits);
+    // v3 protocol: input is RGBA32 (4 bpp), width*height*4 bytes total,
+    // top-down, byte order R,G,B,A. softcam.dll converts to BGRA32
+    // (B,G,R,A) and writes that to shared memory. The name is preserved
+    // from the legacy v2 entry point for binary-compat with Dart FFI
+    // lookup.
+    return softcam::sender::SendFrameRGBA(camera, rgba_bits);
 }
 
 extern "C" bool     scWaitForConnection(scCamera camera, float timeout)

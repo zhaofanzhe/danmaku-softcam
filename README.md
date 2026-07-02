@@ -20,9 +20,10 @@ Your code will look like this:
 scCamera cam = scCreateCamera(320, 240, 60);
 for (;;)
 {
-    uint8_t image[320 * 240 * 3];
+    uint8_t image[320 * 240 * 4];
     DrawSomething(image);
-    scSendFrame(cam, image);
+    // v3 protocol: image is RGBA32 (R,G,B,A byte order) top-down.
+    scSendFrameRGBA(cam, image);
 }
 ```
 .

@@ -8,8 +8,13 @@
 #include <chrono>
 #include <ctime>
 
+#include "MjpegEncoder.h"
+#include "SimdConvert.h"
+
 
 namespace {
+
+using SubtypeInfo = ::softcam::SubtypeInfo;
 
 //#define ENABLE_LOG
 //#define LOG_FILE_PATH "C:\\my_temp\\debug_log.txt"
@@ -76,6 +81,53 @@ std::string IID_TO_STR(REFIID riid)
 #endif // ENABLE_LOG
 
 
+// -------------------------------------------------------------------------
+// Subtype table
+// -------------------------------------------------------------------------
+//
+// The order here is the order consumers see via IAMStreamConfig::GetStreamCaps.
+// Many capture graphs (OBS, Chrome getUserMedia, vMix) negotiate the FIRST
+// subtype they support, so ARGB32 sits at index 0 -- it's the only RGB
+// variant that carries alpha and the one we want alpha-aware consumers to
+// pick.
+//
+// YUV family follows in 4:2:2 then 4:2:0 order, then monochrome, then MJPG.
+
+static const SubtypeInfo kSubtypes[] = {
+    // 32-bit RGB family. ARGB32 carries alpha; RGB32 is byte-identical in
+    // memory but advertises as MEDIASUBTYPE_RGB32 so older capture graphs
+    // (no ARGB awareness) still negotiate it.
+    { &MEDIASUBTYPE_ARGB32, 32, BI_RGB,  0, 4, L"ARGB32 (BGRA)" },
+    { &MEDIASUBTYPE_RGB32,  32, BI_RGB,  0, 4, L"RGB32 (BGRA)"  },
+
+    // 4:2:2 packed YUV
+    { &MEDIASUBTYPE_YUY2,   16, MAKEFOURCC('Y','U','Y','2'), mmioFOURCC('Y','U','Y','2'), 0, L"YUY2" },
+    { &MEDIASUBTYPE_UYVY,   16, MAKEFOURCC('U','Y','V','Y'), mmioFOURCC('U','Y','V','Y'), 0, L"UYVY" },
+    { &MEDIASUBTYPE_YVYU,   16, MAKEFOURCC('Y','V','Y','U'), mmioFOURCC('Y','V','Y','U'), 0, L"YVYU" },
+
+    // 4:2:0 planar / semi-planar YUV
+    { &MEDIASUBTYPE_IYUV,   12, MAKEFOURCC('I','Y','U','V'), mmioFOURCC('I','Y','U','V'), 0, L"IYUV (I420)" },
+    { &MEDIASUBTYPE_YV12,   12, MAKEFOURCC('Y','V','1','2'), mmioFOURCC('Y','V','1','2'), 0, L"YV12"        },
+    { &MEDIASUBTYPE_NV12,   12, MAKEFOURCC('N','V','1','2'), mmioFOURCC('N','V','1','2'), 0, L"NV12"        },
+
+    // JPEG (variable length, image size left to encoder)
+    { &MEDIASUBTYPE_MJPG,    0, MAKEFOURCC('M','J','P','G'), mmioFOURCC('M','J','P','G'), 0, L"MJPG" },
+};
+
+
+// MJPG's biSizeImage is unknown at SetFormat time. We give consumers a
+// conservative hint (a quarter of the BGRA32 frame size), which is enough
+// to size the allocator pool without choking on actual larger JPEGs.
+static std::uint32_t mjpgHintSize(int w, int h)
+{
+    return (static_cast<std::uint32_t>(w) * static_cast<std::uint32_t>(h)) / 2u;
+}
+
+
+// -------------------------------------------------------------------------
+// AM_MEDIA_TYPE helpers
+// -------------------------------------------------------------------------
+
 AM_MEDIA_TYPE* allocateMediaType()
 {
     BYTE *pbFormat = (BYTE*)CoTaskMemAlloc(sizeof(VIDEOINFOHEADER));
@@ -95,13 +147,35 @@ AM_MEDIA_TYPE* allocateMediaType()
     return amt;
 }
 
-std::size_t calcDIBSize(int width, int height)
+std::uint32_t calcDIBSizeImpl(int width, int height, const SubtypeInfo& sub)
 {
-    std::size_t stride = (static_cast<unsigned>(width) * 3 + 3) & ~3u;
-    return stride * static_cast<unsigned>(height);
+    // RGB-family uses 4-byte aligned rows. biSizeImage hint also has to
+    // match the stride rounding for the capture graph's allocator sizing.
+    if (sub.biCompression == BI_RGB && sub.biBitCount >= 8)
+    {
+        std::uint32_t row_bytes = (static_cast<std::uint32_t>(width) * sub.biBitCount + 7u) / 8u;
+        std::uint32_t stride = (row_bytes + 3u) & ~3u;
+        return stride * static_cast<std::uint32_t>(height);
+    }
+
+    switch (sub.biBitCount)
+    {
+        case 16: // 4:2:2 packed
+            return static_cast<std::uint32_t>(width) * static_cast<std::uint32_t>(height) * 2u;
+        case 12: // 4:2:0 planar
+            return static_cast<std::uint32_t>(width) * static_cast<std::uint32_t>(height) * 3u / 2u;
+        case 8:  // monochrome
+            return static_cast<std::uint32_t>(width) * static_cast<std::uint32_t>(height);
+        case 0:  // MJPG / H264 -- variable length
+            return mjpgHintSize(width, height);
+        default:
+            return 0;
+    }
 }
 
-void fillMediaType(AM_MEDIA_TYPE* amt, int width, int height, float framerate)
+void fillMediaType(AM_MEDIA_TYPE* amt,
+                   int width, int height, float framerate,
+                   const SubtypeInfo& sub)
 {
     BYTE *pbFormat = amt->pbFormat;
 
@@ -109,7 +183,10 @@ void fillMediaType(AM_MEDIA_TYPE* amt, int width, int height, float framerate)
     {
         framerate = 60.0f;
     }
-    const float bit_rate = (float)width * (float)height * 24 * framerate;
+    // bit_rate is informational; for variable-length codecs we just guess
+    // a conservative average so upstream filters don't choke on dwBitRate=0.
+    const float avg_bytes_per_frame = std::max<std::uint32_t>(calcDIBSizeImpl(width, height, sub), 1u);
+    const float bit_rate = avg_bytes_per_frame * 8.0f * framerate;
     const float period = 10 * 1000 * 1000 / framerate;
 
     VIDEOINFOHEADER* pFormat = (VIDEOINFOHEADER*)pbFormat;
@@ -121,36 +198,70 @@ void fillMediaType(AM_MEDIA_TYPE* amt, int width, int height, float framerate)
     pFormat->bmiHeader.biWidth = width;
     pFormat->bmiHeader.biHeight = height;
     pFormat->bmiHeader.biPlanes = 1;
-    pFormat->bmiHeader.biBitCount = 24;
-    pFormat->bmiHeader.biCompression = BI_RGB;
-    pFormat->bmiHeader.biSizeImage = static_cast<uint32_t>(calcDIBSize(width, height));
+    pFormat->bmiHeader.biBitCount = sub.biBitCount;
+    pFormat->bmiHeader.biCompression = sub.biCompression;
+    pFormat->bmiHeader.biSizeImage = calcDIBSizeImpl(width, height, sub);
 
     amt->majortype = MEDIATYPE_Video;
-    amt->subtype = MEDIASUBTYPE_RGB24;
-    amt->bFixedSizeSamples = TRUE;
+    amt->subtype = *sub.subtype;
+    amt->bFixedSizeSamples = (sub.biBitCount != 0);  // MJPG is VBR
     amt->bTemporalCompression = FALSE;
-    amt->lSampleSize = static_cast<uint32_t>(calcDIBSize(width, height));
+    amt->lSampleSize = static_cast<uint32_t>(calcDIBSizeImpl(width, height, sub));
     amt->formattype = FORMAT_VideoInfo;
     amt->pUnk = nullptr;
     amt->cbFormat = sizeof(VIDEOINFOHEADER);
     amt->pbFormat = pbFormat;
 }
 
-AM_MEDIA_TYPE* makeMediaType(int width, int height, float framerate)
+AM_MEDIA_TYPE* makeMediaType(int width, int height, float framerate,
+                             const SubtypeInfo& sub)
 {
     AM_MEDIA_TYPE *amt = allocateMediaType();
     if (!amt)
     {
         return nullptr;
     }
-    fillMediaType(amt, width, height, framerate);
+    fillMediaType(amt, width, height, framerate, sub);
     return amt;
 }
 
 } //namespace
 
+
+// -------------------------------------------------------------------------
+// SubtypeInfo API
+// -------------------------------------------------------------------------
+
 namespace softcam {
 
+const SubtypeInfo* supportedSubtypes()
+{
+    return kSubtypes;
+}
+
+std::size_t supportedSubtypeCount()
+{
+    return sizeof(kSubtypes) / sizeof(kSubtypes[0]);
+}
+
+const SubtypeInfo* findSubtype(const GUID& subtype)
+{
+    for (std::size_t i = 0; i < supportedSubtypeCount(); ++i)
+    {
+        if (subtype == *kSubtypes[i].subtype) return &kSubtypes[i];
+    }
+    return nullptr;
+}
+
+std::uint32_t calcDIBSize(int width, int height, const SubtypeInfo& sub)
+{
+    return calcDIBSizeImpl(width, height, sub);
+}
+
+
+// -------------------------------------------------------------------------
+// Softcam filter
+// -------------------------------------------------------------------------
 
 CUnknown * Softcam::CreateInstance(
                     LPUNKNOWN   lpunk,
@@ -169,12 +280,9 @@ Softcam::Softcam(LPUNKNOWN lpunk, const GUID& clsid, HRESULT *phr) :
     m_valid(m_frame_buffer ? true : false),
     m_width(m_frame_buffer.width()),
     m_height(m_frame_buffer.height()),
+    m_bpp(m_frame_buffer.bpp()),
     m_framerate(m_frame_buffer.framerate())
 {
-    // This code is okay though it may look strange as the return value is ignored.
-    // Calling the SoftcamStream constructor results in calling the CBaseOutputPin
-    // constructor which registers the instance to this Softcam instance by calling
-    // CSource::AddPin().
     (void)new SoftcamStream(phr, this, L"DirectShow Softcam Stream");
 }
 
@@ -207,10 +315,15 @@ Softcam::SetFormat(AM_MEDIA_TYPE *mt)
         LOG("-> E_FAIL\n");
         return E_FAIL;
     }
-    if (mt->majortype != MEDIATYPE_Video ||
-        mt->subtype != MEDIASUBTYPE_RGB24)
+    if (mt->majortype != MEDIATYPE_Video)
     {
-        LOG("-> E_FAIL (invalid media type)\n");
+        LOG("-> E_FAIL (invalid major type)\n");
+        return E_FAIL;
+    }
+    const SubtypeInfo* sub = findSubtype(mt->subtype);
+    if (!sub)
+    {
+        LOG("-> E_FAIL (unsupported subtype)\n");
         return E_FAIL;
     }
     if (mt->formattype == FORMAT_VideoInfo && mt->pbFormat)
@@ -222,8 +335,8 @@ Softcam::SetFormat(AM_MEDIA_TYPE *mt)
             LOG("-> E_FAIL (invalid dimension)\n");
             return E_FAIL;
         }
-        if (pFormat->bmiHeader.biBitCount != 24 ||
-            pFormat->bmiHeader.biCompression != BI_RGB)
+        if (pFormat->bmiHeader.biCompression != sub->biCompression ||
+            pFormat->bmiHeader.biBitCount != sub->biBitCount)
         {
             LOG("-> E_FAIL (invalid color format)\n");
             return E_FAIL;
@@ -246,7 +359,10 @@ Softcam::GetFormat(AM_MEDIA_TYPE **out_pmt)
         LOG("-> E_FAIL\n");
         return E_FAIL;
     }
-    AM_MEDIA_TYPE* mt = makeMediaType(m_width, m_height, m_framerate);
+    // Default subtype is ARGB32 -- alpha-aware consumers see a real
+    // transparent channel, legacy RGB32/YUV consumers re-negotiate via
+    // GetStreamCaps.
+    AM_MEDIA_TYPE* mt = makeMediaType(m_width, m_height, m_framerate, *findSubtype(MEDIASUBTYPE_ARGB32));
     if (!mt)
     {
         LOG("-> E_OUTOFMEMORY\n");
@@ -270,9 +386,9 @@ Softcam::GetNumberOfCapabilities(int *out_count, int *out_size)
         LOG("-> E_FAIL\n");
         return E_FAIL;
     }
-    *out_count = 1;
+    *out_count = static_cast<int>(supportedSubtypeCount());
     *out_size = sizeof(VIDEO_STREAM_CONFIG_CAPS);
-    LOG("-> S_OK\n");
+    LOG("-> S_OK (count=%d)\n", *out_count);
     return S_OK;
 }
 
@@ -289,12 +405,13 @@ Softcam::GetStreamCaps(int index, AM_MEDIA_TYPE **out_pmt, BYTE *out_scc)
         LOG("-> E_FAIL\n");
         return E_FAIL;
     }
-    if (index >= 1)
+    if (index < 0 || static_cast<std::size_t>(index) >= supportedSubtypeCount())
     {
-        LOG("-> S_FALSE (invalid index)\n");
+        LOG("-> S_FALSE (invalid index %d)\n", index);
         return S_FALSE;
     }
-    AM_MEDIA_TYPE *mt = makeMediaType(m_width, m_height, m_framerate);
+    const SubtypeInfo& sub = supportedSubtypes()[index];
+    AM_MEDIA_TYPE *mt = makeMediaType(m_width, m_height, m_framerate, sub);
     if (!mt)
     {
         LOG("-> E_OUTOFMEMORY\n");
@@ -324,7 +441,7 @@ Softcam::GetStreamCaps(int index, AM_MEDIA_TYPE **out_pmt, BYTE *out_scc)
     scc->MaxFrameInterval = format->AvgTimePerFrame;
     scc->MinBitsPerSecond = (LONG)format->dwBitRate;
     scc->MaxBitsPerSecond = (LONG)format->dwBitRate;
-    LOG("-> S_OK\n");
+    LOG("-> S_OK (subtype=%ws)\n", sub.label);
     return S_OK;
 }
 
@@ -365,13 +482,20 @@ Softcam::releaseFrameBuffer()
     m_frame_buffer.release();
 }
 
+
+// -------------------------------------------------------------------------
+// SoftcamStream
+// -------------------------------------------------------------------------
+
 SoftcamStream::SoftcamStream(HRESULT *phr,
                          Softcam *pParent,
                          LPCWSTR pPinName) :
     CSourceStream(NAME("DirectShow Softcam Stream"), phr, pParent, pPinName),
     m_valid(pParent->valid()),
     m_width(pParent->width()),
-    m_height(pParent->height())
+    m_height(pParent->height()),
+    m_bpp(pParent->bpp()),
+    m_subtype(findSubtype(MEDIASUBTYPE_ARGB32))
 {
 }
 
@@ -404,6 +528,118 @@ STDMETHODIMP SoftcamStream::NonDelegatingQueryInterface(REFIID riid, __deref_out
 }
 
 
+namespace {
+
+// Top-down BGRA32 -> bottom-up RGB32 / ARGB32 DIB rows.
+//
+// In shmem we store BGRA32 top-down. DIBs want bottom-up rows with the
+// natural pixel byte order -- RGB32 and ARGB32 on little-endian both have
+// the bytes in BGRA order on disk. So the only thing to do is flip rows.
+// (No conversion needed: the wire format is already BGRA.)
+//
+// stride_bytes = ((w * 4) + 3) & ~3.
+void copyBGRA_to_RGB32_dib(const uint8_t* src_topdown,
+                           uint8_t*       dst_bottomup,
+                           int w, int h)
+{
+    const std::uint32_t row_bytes = static_cast<std::uint32_t>(w) * 4u;
+    const std::uint32_t stride    = (row_bytes + 3u) & ~3u;
+    for (int y = 0; y < h; ++y)
+    {
+        const uint8_t* src_row = src_topdown + static_cast<std::size_t>(row_bytes) * y;
+        uint8_t* dst_row = dst_bottomup + static_cast<std::size_t>(stride) * y;
+        std::memcpy(dst_row, src_row, row_bytes);
+        if (stride > row_bytes)
+        {
+            std::memset(dst_row + row_bytes, 0, stride - row_bytes);
+        }
+    }
+}
+
+// Fill a YUV/MJPG subtype buffer from a top-down BGRA32 scratch frame.
+void fill_yuv_subtype(uint8_t* pData, int w, int h,
+                      const SubtypeInfo& sub,
+                      const uint8_t* bgra_topdown,
+                      MjpegEncoder* mjpeg)
+{
+    if (sub.subtype == &MEDIASUBTYPE_YUY2)
+    {
+        softcam::convert_bgra_to_yuy2(bgra_topdown, pData,
+                                      static_cast<std::size_t>(w) * h);
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_UYVY)
+    {
+        softcam::convert_bgra_to_uyvy(bgra_topdown, pData,
+                                      static_cast<std::size_t>(w) * h);
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_YVYU)
+    {
+        softcam::convert_bgra_to_yvyu(bgra_topdown, pData,
+                                      static_cast<std::size_t>(w) * h);
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_IYUV)
+    {
+        // I420 layout: Y plane = w*h, U plane = (w/2)*(h/2), V plane.
+        std::uint32_t y_stride = static_cast<std::uint32_t>(w);
+        std::uint32_t u_stride = y_stride / 2u;
+        std::uint8_t* y_plane = pData;
+        std::uint8_t* u_plane = y_plane + y_stride * static_cast<std::uint32_t>(h);
+        std::uint8_t* v_plane = u_plane + u_stride * (static_cast<std::uint32_t>(h) / 2u);
+        softcam::convert_bgra_to_i420(bgra_topdown, y_plane, y_stride,
+                                      u_plane, u_stride, v_plane, u_stride,
+                                      static_cast<std::uint32_t>(w),
+                                      static_cast<std::uint32_t>(h));
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_YV12)
+    {
+        std::uint32_t y_stride = static_cast<std::uint32_t>(w);
+        std::uint32_t u_stride = y_stride / 2u;
+        std::uint8_t* y_plane = pData;
+        std::uint8_t* v_plane = y_plane + y_stride * static_cast<std::uint32_t>(h);
+        std::uint8_t* u_plane = v_plane + u_stride * (static_cast<std::uint32_t>(h) / 2u);
+        softcam::convert_bgra_to_yv12(bgra_topdown, y_plane, y_stride,
+                                      u_plane, u_stride, v_plane, u_stride,
+                                      static_cast<std::uint32_t>(w),
+                                      static_cast<std::uint32_t>(h));
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_NV12)
+    {
+        std::uint32_t y_stride = static_cast<std::uint32_t>(w);
+        std::uint32_t uv_stride = y_stride;
+        std::uint8_t* y_plane = pData;
+        std::uint8_t* uv_plane = y_plane + y_stride * static_cast<std::uint32_t>(h);
+        softcam::convert_bgra_to_nv12(bgra_topdown, y_plane, y_stride,
+                                      uv_plane, uv_stride,
+                                      static_cast<std::uint32_t>(w),
+                                      static_cast<std::uint32_t>(h));
+    }
+    else if (sub.subtype == &MEDIASUBTYPE_MJPG)
+    {
+        if (!mjpeg)
+        {
+            LOG("(SoftcamStream) MJPG encoder not initialized\n");
+            return;
+        }
+        // The DShow allocator sizes the IMediaSample buffer from
+        // biSizeImage (mjpgHintSize = w*h/2). For 1080p that's 1 MB which
+        // is enough at quality 80. 4K scenes need a larger pool -- callers
+        // can renegotiate via SetFormat after the initial connection.
+        const std::size_t cap = static_cast<std::size_t>(w) * h / 2u;
+        std::size_t written = mjpeg->encode(bgra_topdown, w, h, pData, cap);
+        if (written == 0)
+        {
+            LOG("(SoftcamStream) MJPG encode failed, frame dropped\n");
+        }
+    }
+    else
+    {
+        LOG("(SoftcamStream) unhandled subtype %ws in fill_yuv_subtype\n", sub.label);
+    }
+}
+
+} //namespace
+
+
 HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
 {
     CheckPointer(pms,E_POINTER);
@@ -416,37 +652,75 @@ HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
         if (auto fb = getParent()->getFrameBuffer())
         {
             bool active = fb->waitForNewFrame(m_frame_counter);
-            fb->transferToDIB(pData, &m_frame_counter);
 
-            if (!active)
+            if (m_subtype && m_subtype->biCompression == BI_RGB)
             {
-                // The sender has deactivated this stream and stopped sending frames.
-                // We release this stream and will wait a new stream to be available.
-                getParent()->releaseFrameBuffer();
+                // For ARGB32 / RGB32 the wire pixels are already BGRA32
+                // top-down and the DIB wants BGRA bottom-up. transferToDIB
+                // handles the row-flip in one shot.
+                fb->transferToDIB(pData, &m_frame_counter);
 
-                // Save the last image for a placeholder.
-                const std::size_t size = calcDIBSize(m_width, m_height);
-                if (!m_screenshot)
+                if (!active)
                 {
-                    m_screenshot.reset(new uint8_t[size]);
-                }
-                {
-                    // Darken the image to indicate that the source is inactive.
+                    const std::size_t size = (std::size_t)m_bpp * m_width * m_height;
+                    if (!m_screenshot)
+                    {
+                        m_screenshot.reset(new uint8_t[size]);
+                    }
                     for (std::size_t i = 0; i < size; i++)
                     {
                         pData[i] /= 4;
                     }
+                    std::memcpy(m_screenshot.get(), pData, size);
                 }
-                std::memcpy(m_screenshot.get(), pData, size);
+            }
+            else
+            {
+                // YUV / MJPG path: pull a top-down BGRA scratch copy and
+                // convert per-subtype. transferToDIB still increments
+                // m_frame_counter via the FrameBuffer.
+                const std::size_t bgra_bytes = (std::size_t)m_width * m_height * 4;
+                if (!m_screenshot)
+                {
+                    m_screenshot.reset(new uint8_t[bgra_bytes]);
+                }
+                uint64_t ignored = 0;
+                fb->transferToDIB(m_screenshot.get(), &ignored);
+
+                std::unique_ptr<uint8_t[]> topdown(new uint8_t[bgra_bytes]);
+                const std::uint32_t row_bytes = static_cast<std::uint32_t>(m_width) * 4u;
+                for (int y = 0; y < m_height; ++y)
+                {
+                    std::memcpy(topdown.get() + (std::size_t)y * row_bytes,
+                                m_screenshot.get() + (std::size_t)(m_height - 1 - y) * row_bytes,
+                                row_bytes);
+                }
+                if (!active)
+                {
+                    // Use darkened screenshot as the source for YUV/MJPG.
+                    for (std::size_t i = 0; i < bgra_bytes; i++)
+                    {
+                        topdown[i] /= 4;
+                    }
+                }
+                if (m_subtype->subtype == &MEDIASUBTYPE_MJPG && !m_mjpeg)
+                {
+                    m_mjpeg.reset(new MjpegEncoder());
+                }
+                fill_yuv_subtype(pData, m_width, m_height, *m_subtype,
+                                 topdown.get(), m_mjpeg.get());
             }
         }
         else
         {
-            // Waiting for a new stream.
             m_frame_counter = 0;
             Timer::sleep(0.100f);
 
-            const std::size_t size = calcDIBSize(m_width, m_height);
+            const std::size_t size = (std::size_t)m_bpp * m_width * m_height;
+            if (!m_screenshot)
+            {
+                m_screenshot.reset(new uint8_t[size]);
+            }
             std::memcpy(pData, m_screenshot.get(), size);
         }
 
@@ -456,7 +730,6 @@ HRESULT SoftcamStream::FillBuffer(IMediaSample *pms)
         pms->SetTime((REFERENCE_TIME*)&start,(REFERENCE_TIME*)&m_sample_time);
     }
     pms->SetSyncPoint(TRUE);
-    //LOG("-> NOERROR\n");
     return NOERROR;
 }
 
@@ -469,7 +742,6 @@ STDMETHODIMP SoftcamStream::Notify(IBaseFilter * pSender, Quality q)
     if (q.Late > 0) {
         m_sample_time += q.Late;
     }
-    //LOG("-> NOERROR\n");
     return NOERROR;
 }
 
@@ -491,9 +763,11 @@ HRESULT SoftcamStream::GetMediaType(CMediaType *pmt)
         return E_OUTOFMEMORY;
     }
 
-    fillMediaType(pmt, getParent()->width(), getParent()->height(), getParent()->framerate());
+    const SubtypeInfo* sub = m_subtype ? m_subtype : findSubtype(MEDIASUBTYPE_ARGB32);
+    fillMediaType(pmt, getParent()->width(), getParent()->height(),
+                  getParent()->framerate(), *sub);
 
-    LOG("-> NOERROR\n");
+    LOG("-> NOERROR (subtype=%ws)\n", sub->label);
     return NOERROR;
 }
 
@@ -609,7 +883,15 @@ HRESULT SoftcamStream::QuerySupported(REFGUID guidPropSet, DWORD dwPropID,
 
 HRESULT SoftcamStream::SetFormat(AM_MEDIA_TYPE *mt)
 {
-    return getParent()->SetFormat(mt);
+    if (!mt) return E_POINTER;
+    const SubtypeInfo* sub = findSubtype(mt->subtype);
+    if (!sub) return E_FAIL;
+    HRESULT hr = getParent()->SetFormat(mt);
+    if (SUCCEEDED(hr))
+    {
+        m_subtype = sub;
+    }
+    return hr;
 }
 
 HRESULT SoftcamStream::GetFormat(AM_MEDIA_TYPE **out_pmt)

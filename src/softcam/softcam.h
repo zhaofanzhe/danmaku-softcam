@@ -26,7 +26,7 @@ extern "C"
 
         If the value of the `framerate` argument is 0, the interval of each
         frame is not constrained and every frame is sent immediately by the
-        `scSendFrame` function. This is useful if the application has a
+        `scSendFrameRGBA` function. This is useful if the application has a
         real-time source stream such as actual webcams.
 
         If this function succeeds, it returns the handle of a new virtual
@@ -50,17 +50,23 @@ extern "C"
     /*
         This function sends a new frame of the specified virtual camera.
 
+        The pixel layout is RGBA32 (top-down, byte order R, G, B, A),
+        4 bytes per pixel, width * height * 4 bytes total. softcam.dll
+        converts to BGRA32 (B, G, R, A byte order) and writes that to
+        shared memory. The receiver validates the size and rejects
+        mismatched frames.
+
         If the framerate set to the virtual camera is not zero, this
         function tries to make the timing to deliver the new image ideal
-        as much as possible by sleeping for an appropriate time inside the
-        function.
+        as much as possible by sleeping for an appropriate time inside
+        the function.
 
         If the framerate set to the virtual camera is zero, this function
         sends the new image immediately and does not control that timing.
         This is useful if the application has a real-time source stream
         such as actual webcams.
     */
-    void        SOFTCAM_API scSendFrame(scCamera camera, const void* image_bits);
+    void        SOFTCAM_API scSendFrameRGBA(scCamera camera, const void* rgba_bits);
 
     /*
         This function waits until an application connects to the specified

@@ -52,9 +52,7 @@ void            DeleteCamera(CameraHandle camera)
 
 namespace {
 
-// Throttle frame delivery to the configured framerate. Shared by both
-// SendFrame and SendFrameRGBA so behavior is identical regardless of which
-// pixel format the caller is using.
+// Throttle frame delivery to the configured framerate.
 void throttle(Camera& target, float framerate, uint64_t frame_counter)
 {
     if (0.0f >= framerate) return;
@@ -84,20 +82,22 @@ void throttle(Camera& target, float framerate, uint64_t frame_counter)
 
 } //namespace
 
-void            SendFrame(CameraHandle camera, const void* image_bits)
-{
-    Camera* target = static_cast<Camera*>(camera);
-    if (target && s_camera.load() == target && image_bits)
-    {
-        auto framerate = target->m_frame_buffer.framerate();
-        auto frame_counter = target->m_frame_buffer.frameCounter();
-
-        throttle(*target, framerate, frame_counter);
-
-        target->m_frame_buffer.write(image_bits);
-    }
-}
-
+// Sender-side entry point.
+//
+// Dart's `ui.Image.toByteData(format: rawRgba)` returns bytes in
+//   [R, G, B, A, R, G, B, A, ...]
+// byte order, top-down. The v3 shared-memory wire is BGRA32
+//   [B, G, R, A, B, G, R, A, ...]
+// which matches what DirectShow consumers expect on little-endian x86/x64.
+//
+// We convert in-place into a thread_local scratch buffer (one full frame
+// at a time) using the SSSE3 byte shuffle from SimdConvert.h, then ship
+// the BGRA32 bytes to FrameBuffer::write which memcpy's them into shmem
+// under the named mutex. For 1920x1080 this is ~8 MB scratch -- the
+// thread_local avoids calloc/free churn on the hot path.
+//
+// Receivers that open() FrameBuffer validate m_bpp == 4 and reject any
+// other wire layout (hard protocol upgrade).
 void            SendFrameRGBA(CameraHandle camera, const void* rgba_bits)
 {
     Camera* target = static_cast<Camera*>(camera);
@@ -105,27 +105,15 @@ void            SendFrameRGBA(CameraHandle camera, const void* rgba_bits)
     {
         auto framerate = target->m_frame_buffer.framerate();
         auto frame_counter = target->m_frame_buffer.frameCounter();
-        int w = target->m_frame_buffer.width();
-        int h = target->m_frame_buffer.height();
-        std::size_t pixel_count = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
 
         throttle(*target, framerate, frame_counter);
 
-        // Convert RGBA (top-down, byte order R,G,B,A) to BGR (top-down,
-        // byte order B,G,R) -- the layout transferToDIB expects to find
-        // verbatim in shared memory. SimdConvert picks SSE2/AVX2 when
-        // available, scalar fallback otherwise.
-        //
-        // We allocate a full-frame scratch buffer (w*h*3 bytes) so the
-        // write() lock is acquired exactly once, matching SendFrame
-        // semantics. For 1920x1080 this is ~6 MB per call, which we
-        // re-use across calls via a thread_local to avoid the allocation
-        // churn.
-        static thread_local std::vector<uint8_t> scratch;
-        std::size_t need = pixel_count * 3;
-        if (scratch.size() < need) scratch.resize(need);
-        convert_rgba_to_bgr(
-            static_cast<const uint8_t*>(rgba_bits),
+        const std::size_t pixel_count = static_cast<std::size_t>(target->m_frame_buffer.width())
+                                      * static_cast<std::size_t>(target->m_frame_buffer.height());
+        static thread_local std::vector<std::uint8_t> scratch;
+        if (scratch.size() < pixel_count * 4) scratch.resize(pixel_count * 4);
+        softcam::convert_rgba_to_bgra(
+            static_cast<const std::uint8_t*>(rgba_bits),
             scratch.data(),
             pixel_count);
         target->m_frame_buffer.write(scratch.data());

@@ -9,7 +9,7 @@ namespace softcam {
 
 const char NamedMutexName[] = "DirectShow Softcam/NamedMutex";
 const char SharedMemoryName[] = "DirectShow Softcam/SharedMemory";
-const uint8_t ProtocolVersion = 2;
+const uint8_t ProtocolVersion = 3;
 
 
 struct FrameBuffer::Header
@@ -17,9 +17,11 @@ struct FrameBuffer::Header
     uint32_t    m_image_offset;
     uint16_t    m_width;
     uint16_t    m_height;
+    uint8_t     m_bpp;                  // bytes per pixel: 4 (BGRA32)
+    uint8_t     m_reserved;             // padding
     float       m_framerate;
     uint8_t     m_is_active;
-    uint8_t     m_connected_min_version; // 0 or 1 or 2
+    uint8_t     m_connected_min_version; // 0, 1, 2, or 3
     uint8_t     m_watchdog_sender_heartbeat;
     uint8_t     m_watchdog_receiver_heartbeat;
     uint64_t    m_frame_counter;
@@ -51,7 +53,7 @@ FrameBuffer FrameBuffer::create(
         return fb;
     }
 
-    auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height);
+    auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height, 4);
     fb.m_shmem = SharedMemory::create(SharedMemoryName, shmem_size);
     if (fb.m_shmem)
     {
@@ -61,6 +63,8 @@ FrameBuffer FrameBuffer::create(
         frame->m_image_offset = sizeof(Header);
         frame->m_width = (uint16_t)width;
         frame->m_height = (uint16_t)height;
+        frame->m_bpp = 4; // BGRA32
+        frame->m_reserved = 0;
         frame->m_framerate = framerate;
         frame->m_is_active = 1;
         frame->m_connected_min_version = 0;
@@ -110,7 +114,14 @@ FrameBuffer FrameBuffer::open()
             fb.m_shmem = {};
             return fb;
         }
-        uint32_t image_size = (uint32_t)frame->m_width * (uint32_t)frame->m_height * 3;
+        // v3 protocol: bpp must be 4 (BGRA32). Anything else is rejected
+        // because we cannot safely interpret the image bytes.
+        if (frame->m_bpp != 4)
+        {
+            fb.m_shmem = {};
+            return fb;
+        }
+        uint32_t image_size = (uint32_t)frame->m_width * (uint32_t)frame->m_height * (uint32_t)frame->m_bpp;
         if (size <= frame->m_image_offset ||
             size - frame->m_image_offset < image_size)
         {
@@ -174,6 +185,12 @@ int FrameBuffer::height() const
     return m_shmem ? header()->m_height : 0;
 }
 
+int FrameBuffer::bpp() const
+{
+    std::lock_guard<NamedMutex> lock(m_mutex);
+    return m_shmem ? header()->m_bpp : 0;
+}
+
 float FrameBuffer::framerate() const
 {
     std::lock_guard<NamedMutex> lock(m_mutex);
@@ -230,7 +247,7 @@ void FrameBuffer::write(const void* image_bits)
     std::memcpy(
             frame->imageData(),
             image_bits,
-            (std::size_t)3 * frame->m_width * frame->m_height);
+            (std::size_t)frame->m_bpp * frame->m_width * frame->m_height);
     frame->m_frame_counter += 1;
 }
 
@@ -247,14 +264,15 @@ void FrameBuffer::transferToDIB(void* image_bits, uint64_t* out_frame_counter)
     {
         int w = frame->m_width;
         int h = frame->m_height;
-        int gap = ((w * 3 + 3) & ~3) - w * 3;
+        int bpp = frame->m_bpp;
+        int gap = ((w * bpp + 3) & ~3) - w * bpp;
         const std::uint8_t* image = frame->imageData();
         std::uint8_t* dest = (std::uint8_t*)image_bits;
         for (int y = 0; y < h; y++)
         {
-            const std::uint8_t* src = image + 3 * w * (h - 1 - y);
-            std::memcpy(dest, src, 3 * (uint32_t)w);
-            dest += 3 * w + gap;
+            const std::uint8_t* src = image + bpp * w * (h - 1 - y);
+            std::memcpy(dest, src, bpp * (uint32_t)w);
+            dest += bpp * w + gap;
         }
         *out_frame_counter = frame->m_frame_counter;
     }
@@ -314,10 +332,11 @@ bool FrameBuffer::checkDimensions(
 
 uint32_t FrameBuffer::calcMemorySize(
                         uint16_t width,
-                        uint16_t height)
+                        uint16_t height,
+                        uint8_t  bpp)
 {
     uint32_t header_size = sizeof(Header);
-    uint32_t image_size = (uint32_t)width * height * 3;
+    uint32_t image_size = (uint32_t)width * height * bpp;
     uint32_t shmem_size = header_size + image_size;
     return shmem_size;
 }

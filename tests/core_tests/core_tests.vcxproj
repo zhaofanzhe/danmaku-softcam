@@ -53,9 +53,11 @@
     <TargetName>core_tests</TargetName>
   </PropertyGroup>
   <ItemGroup>
+    <ClCompile Include="ConvertTest.cpp" />
     <ClCompile Include="DShowSoftcamTest.cpp" />
     <ClCompile Include="FrameBufferTest.cpp" />
     <ClCompile Include="MiscTest.cpp" />
+    <ClCompile Include="MjpegEncoderTest.cpp" />
     <ClCompile Include="SenderAPITest.cpp" />
     <ClCompile Include="WatchdogTest.cpp" />
   </ItemGroup>

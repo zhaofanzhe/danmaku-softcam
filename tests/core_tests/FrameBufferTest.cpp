@@ -17,6 +17,7 @@ TEST(FrameBuffer, Basic1) {
     EXPECT_NE( fb.handle(), nullptr );
     EXPECT_EQ( fb.width(), 320 );
     EXPECT_EQ( fb.height(), 240 );
+    EXPECT_EQ( fb.bpp(), 4 );
     EXPECT_EQ( fb.framerate(), 60.0f );
     EXPECT_EQ( fb.active(), true );
     EXPECT_EQ( fb.connected(), false );
@@ -33,11 +34,13 @@ TEST(FrameBuffer, Basic2) {
     EXPECT_NE( sender.handle(), receiver.handle() );
     EXPECT_EQ( sender.width(), 320 );
     EXPECT_EQ( sender.height(), 240 );
+    EXPECT_EQ( sender.bpp(), 4 );
     EXPECT_EQ( sender.framerate(), 60.0f );
     EXPECT_EQ( sender.active(), true );
     EXPECT_EQ( sender.connected(), true );
     EXPECT_EQ( receiver.width(), 320 );
     EXPECT_EQ( receiver.height(), 240 );
+    EXPECT_EQ( receiver.bpp(), 4 );
     EXPECT_EQ( receiver.framerate(), 60.0f );
     EXPECT_EQ( receiver.active(), true );
     EXPECT_EQ( receiver.connected(), true );
@@ -160,7 +163,7 @@ TEST(FrameBuffer, WriteIncreasesFrameCounter) {
     auto fb = sc::FrameBuffer::create(320, 240, 60);
     EXPECT_EQ( fb.frameCounter(), 0 );
 
-    std::vector<uint8_t> image(320 * 240 * 3, 255);
+    std::vector<uint8_t> image(320 * 240 * 4, 255);
     fb.write(image.data());
     EXPECT_EQ( fb.frameCounter(), 1 );
 
@@ -172,20 +175,22 @@ TEST(FrameBuffer, WriteAndRead) {
     const auto TestPatternR = [](int x, int y) { return (uint8_t)((x + y) & 0xff); };
     const auto TestPatternG = [](int x, int y) { return (uint8_t)((x - y) & 0xff); };
     const auto TestPatternB = [](int x, int y) { return (uint8_t)((x * y) & 0xff); };
+    const auto TestPatternA = [](int x, int y) { return (uint8_t)((x ^ y) & 0xff); };
 
     auto fb = sc::FrameBuffer::create(320, 240, 60);
 
-    std::vector<uint8_t> src(320 * 240 * 3, 111);
-    std::vector<uint8_t> dest(320 * 240 * 3, 222);
+    std::vector<uint8_t> src(320 * 240 * 4, 111);
+    std::vector<uint8_t> dest(320 * 240 * 4, 222);
     for (int y = 0; y < 240; y++)
     {
         for (int x = 0; x < 320; x++)
         {
-            // Top to Bottom, BGR order
-            std::size_t addr = 3 * (x + y * 320);
+            // Top to Bottom, BGRA byte order (matches v3 wire format).
+            std::size_t addr = 4 * (x + y * 320);
             src[addr + 0] = TestPatternB(x, y);
             src[addr + 1] = TestPatternG(x, y);
             src[addr + 2] = TestPatternR(x, y);
+            src[addr + 3] = TestPatternA(x, y);
         }
     }
 
@@ -200,11 +205,12 @@ TEST(FrameBuffer, WriteAndRead) {
     {
         for (int x = 0; x < 320; x++)
         {
-            // Bottom to Top, BGR order
-            std::size_t addr = 3 * (x + (239 - y) * 320);
+            // Bottom to Top, BGRA order.
+            std::size_t addr = 4 * (x + (239 - y) * 320);
             if (dest[addr + 0] != TestPatternB(x, y) ||
                 dest[addr + 1] != TestPatternG(x, y) ||
-                dest[addr + 2] != TestPatternR(x, y))
+                dest[addr + 2] != TestPatternR(x, y) ||
+                dest[addr + 3] != TestPatternA(x, y))
             {
                 error_count += 1;
             }
@@ -262,7 +268,7 @@ TEST(FrameBuffer, WaitForNewFrameStopsAfterNewFrameArrived) {
     sc::Timer::sleep(0.1f);
     EXPECT_EQ( pos, 0 );
 
-    std::vector<uint8_t> image(320 * 240 * 3, 255);
+    std::vector<uint8_t> image(320 * 240 * 4, 255);
     fb.write(image.data());
     sc::Timer::sleep(0.1f);
     EXPECT_EQ( pos, 1 );
@@ -284,7 +290,7 @@ TEST(FrameBuffer, WaitForNewFrameStopsWhenDeactivated) {
     sc::Timer::sleep(0.1f);
     EXPECT_EQ( pos, 0 );
 
-    std::vector<uint8_t> image(320 * 240 * 3, 255);
+    std::vector<uint8_t> image(320 * 240 * 4, 255);
     fb.deactivate();
     sc::Timer::sleep(0.1f);
     EXPECT_EQ( pos, 1 );

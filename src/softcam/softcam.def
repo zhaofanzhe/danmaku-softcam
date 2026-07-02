@@ -6,7 +6,6 @@ EXPORTS
             DllUnregisterServer     PRIVATE
             scCreateCamera
             scDeleteCamera
-            scSendFrame
             scSendFrameRGBA
             scWaitForConnection
             scIsConnected

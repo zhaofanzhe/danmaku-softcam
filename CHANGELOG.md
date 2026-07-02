@@ -5,6 +5,46 @@ All notable changes to the Softcam library will be documented in this file.
 ### [Unreleased]
 - **BREAKING CHANGES**
     - Added disconnection detection mechanism, and now `scWaitForConnection()` and `scIsConnected()` can be used to detect both connection and disconnection. Previously, these functions returned true forever after the first connection detection, even if the connection was already lost. [#70](https://github.com/tshino/softcam/pull/70)
+- **Wire protocol upgraded to v3.**
+    - Shared-memory wire layout is now BGRA32 (4 bytes per pixel), top-down.
+      Previously the wire was RGB24 (3 bytes per pixel). Receivers validate
+      `m_bpp == 4` and reject anything else; old senders must be rebuilt.
+    - `ProtocolVersion` bumped from 2 to 3.
+    - The FrameBuffer `Header` carries a `m_bpp` field so version mismatch is
+      detected on `open()`.
+- **Multi-subtype DirectShow output.** `IAMStreamConfig::GetStreamCaps` now
+  advertises 10 media types (alphabetically):
+    - `MEDIASUBTYPE_ARGB32` -- 32-bit BGRA, the alpha-aware default
+    - `MEDIASUBTYPE_RGB32`  -- 32-bit BGRA, byte-identical to ARGB32 in memory
+    - `MEDIASUBTYPE_YUY2`   -- 4:2:2 packed
+    - `MEDIASUBTYPE_UYVY`   -- 4:2:2 packed
+    - `MEDIASUBTYPE_YVYU`   -- 4:2:2 packed
+    - `MEDIASUBTYPE_IYUV`   -- 4:2:0 planar (I420)
+    - `MEDIASUBTYPE_YV12`   -- 4:2:0 planar
+    - `MEDIASUBTYPE_NV12`   -- 4:2:0 semi-planar
+    - `MEDIASUBTYPE_Y800`   -- monochrome luma
+    - `MEDIASUBTYPE_MJPG`   -- JPEG via WIC, quality default 80
+  Consumers pick the first subtype they understand; OBS prefers ARGB32 so
+  chroma-key works without further configuration.
+- **Sender API changed.** The v2 `scSendFrame(scCamera, const void* image_bits)`
+  entry point has been removed. The single producer-side entry is now
+  `scSendFrameRGBA(scCamera, const void* rgba_bits)`, which expects
+  RGBA32 (R,G,B,A byte order, width*height*4 bytes, top-down) -- matching
+  what Flutter's `ui.Image.toByteData(format: rawRgba)` produces. softcam.dll
+  internally repacks to BGRA via an SSSE3 byte shuffle.
+- **SIMD pixel converters.** The YUV / monochrome conversions in
+  `softcamcore/SimdConvert.h` are new. SSE2 is required (universal on x64);
+  AVX2 is not currently used because the SSE2 paths already saturate the
+  vsync budget at 1080p and AVX2 state save/restore would add jitter.
+- **WIC MJPG encoder.** `softcamcore/MjpegEncoder` encodes BGRA frames to
+  JPEG using Windows Imaging Component (no external dependencies). Quality
+  defaults to 80; consumer-side allocator sizes are derived from the
+  MJPG `biSizeImage` hint of `width*height/2` bytes which is sufficient
+  for quality-80 1080p content.
+- **Producer-side simplification.** `SenderAPI::SendFrameRGBA` no longer
+  shuffles the entire frame in C++ -- it does a single SSSE3
+  RGBA->BGRA pass into a thread_local scratch buffer, then memcpy's into
+  shared memory under the named mutex.
 
 ### [1.8.1] - 2025-03-21
 - Bumped Pybind11 version in the python_binding example. [#67](https://github.com/tshino/softcam/pull/67)
