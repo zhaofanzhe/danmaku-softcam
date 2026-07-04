@@ -116,7 +116,7 @@ void            SendFrameRGBA(CameraHandle camera, const void* rgba_bits)
         auto framerate = target->m_frame_buffer.framerate();
         auto frame_counter = target->m_frame_buffer.frameCounter();
 
-        throttle(*target, framerate, frame_counter);
+        //throttle(*target, framerate, frame_counter);
 
         const std::size_t pixel_count = static_cast<std::size_t>(target->m_frame_buffer.width())
                                       * static_cast<std::size_t>(target->m_frame_buffer.height());
