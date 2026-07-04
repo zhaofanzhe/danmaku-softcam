@@ -1,6 +1,7 @@
 #include "Misc.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <cmath>
 #include <cassert>
 
@@ -122,16 +123,34 @@ SharedMemory::SharedMemory(const char* name, unsigned long size)
     m_handle.reset(
         CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, size, name),
         closeHandle);
-    if (m_handle && GetLastError() != ERROR_ALREADY_EXISTS)
+    DWORD err = GetLastError();
+    fprintf(stderr, "[softcam] SharedMemory::create name='%s' size=%lu handle=%p err=%lu\n",
+        name, size, m_handle.get(), err);
+    fflush(stderr);
+    if (m_handle && err != ERROR_ALREADY_EXISTS)
     {
         m_address.reset(
             MapViewOfFile(m_handle.get(), FILE_MAP_WRITE, 0, 0, 0),
             unmap);
         if (m_address)
         {
+            fprintf(stderr, "[softcam] SharedMemory::create OK addr=%p\n", m_address.get());
+            fflush(stderr);
             m_size = size;
             return;
         }
+        fprintf(stderr, "[softcam] SharedMemory::create FAILED: MapViewOfFile failed err=%lu\n", GetLastError());
+        fflush(stderr);
+    }
+    else if (m_handle)
+    {
+        fprintf(stderr, "[softcam] SharedMemory::create FAILED: ERROR_ALREADY_EXISTS\n");
+        fflush(stderr);
+    }
+    else
+    {
+        fprintf(stderr, "[softcam] SharedMemory::create FAILED: CreateFileMappingA returned null err=%lu\n", err);
+        fflush(stderr);
     }
     release();
 }

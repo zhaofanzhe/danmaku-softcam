@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <vector>
 
 #include "FrameBuffer.h"
@@ -27,16 +28,25 @@ namespace sender {
 
 CameraHandle    CreateCamera(int width, int height, float framerate)
 {
-    if (auto fb = FrameBuffer::create(width, height, framerate))
+    auto fb = FrameBuffer::create(width, height, framerate);
+    fprintf(stderr, "[softcam] FrameBuffer::create result=%s handle=%p\n", fb ? "OK" : "FAILED", fb.handle());
+    fflush(stderr);
+    if (fb)
     {
         Camera* camera = new Camera{ fb, Timer() };
         Camera* expected = nullptr;
         if (s_camera.compare_exchange_strong(expected, camera))
         {
+            fprintf(stderr, "[softcam] CreateCamera OK handle=%p\n", camera);
+            fflush(stderr);
             return camera;
         }
         delete camera;
+        fprintf(stderr, "[softcam] CreateCamera FAILED: another camera already registered\n");
+        fflush(stderr);
     }
+    fprintf(stderr, "[softcam] CreateCamera FAILED\n");
+    fflush(stderr);
     return nullptr;
 }
 

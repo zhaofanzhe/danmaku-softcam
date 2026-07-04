@@ -1,6 +1,7 @@
 #include "FrameBuffer.h"
 
 #include <windows.h>
+#include <cstdio>
 #include <mutex> // lock_guard
 
 
@@ -46,14 +47,20 @@ FrameBuffer FrameBuffer::create(
 
     if (!checkDimensions(width, height))
     {
+        fprintf(stderr, "[softcam] FrameBuffer::create FAILED: checkDimensions\n");
+        fflush(stderr);
         return fb;
     }
     if (framerate < 0.0f)
     {
+        fprintf(stderr, "[softcam] FrameBuffer::create FAILED: framerate<0\n");
+        fflush(stderr);
         return fb;
     }
 
     auto shmem_size = calcMemorySize((uint16_t)width, (uint16_t)height, 4);
+    fprintf(stderr, "[softcam] FrameBuffer::create w=%d h=%d shmem_size=%u\n", width, height, shmem_size);
+    fflush(stderr);
     fb.m_shmem = SharedMemory::create(SharedMemoryName, shmem_size);
     if (fb.m_shmem)
     {
@@ -88,6 +95,11 @@ FrameBuffer FrameBuffer::create(
                 std::lock_guard<NamedMutex> lock(mutex);
                 return frame->m_watchdog_receiver_heartbeat;
             });
+    }
+    else
+    {
+        fprintf(stderr, "[softcam] FrameBuffer::create FAILED: SharedMemory::create returned null\n");
+        fflush(stderr);
     }
     return fb;
 }
