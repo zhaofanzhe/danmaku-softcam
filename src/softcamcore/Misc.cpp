@@ -127,7 +127,7 @@ SharedMemory::SharedMemory(const char* name, unsigned long size)
     fprintf(stderr, "[softcam] SharedMemory::create name='%s' size=%lu handle=%p err=%lu\n",
         name, size, m_handle.get(), err);
     fflush(stderr);
-    if (m_handle && err != ERROR_ALREADY_EXISTS)
+    if (m_handle && (err == 0 || err == ERROR_ALREADY_EXISTS))
     {
         m_address.reset(
             MapViewOfFile(m_handle.get(), FILE_MAP_WRITE, 0, 0, 0),
